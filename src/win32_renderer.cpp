@@ -8,11 +8,8 @@
 
 constexpr UINT BUFFER_COUNT = 2;
 
-UINT RTV_DESCRIPTOR_SIZE;
-UINT FRAME_INDEX;
 
-
-struct win32_Renderer {
+typedef struct {
   Microsoft::WRL::ComPtr<ID3D12Device> device;
   Microsoft::WRL::ComPtr<ID3D12CommandQueue> command_queue;
   Microsoft::WRL::ComPtr<IDXGISwapChain3> swap_chain;
@@ -23,13 +20,23 @@ struct win32_Renderer {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline_state;
   Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> command_list;
   Microsoft::WRL::ComPtr<ID3D12Fence> fence;
-};
+} win32_Renderer;
 
-struct win32_Shaders {
+typedef struct {
   Microsoft::WRL::ComPtr<ID3DBlob> vertexShader;
   Microsoft::WRL::ComPtr<ID3DBlob> pixelShader;
-};
+} win32_Shaders;
 
+// DirectX3D 12 renderer - win32 part
+// Resources - static and global
+// Some fence stuff - TODO(moliwa): Move to renderer
+win32_Renderer renderer = {0};
+win32_Shaders shaders   = {0};
+
+UINT RTV_DESCRIPTOR_SIZE;
+UINT FRAME_INDEX;
+HANDLE g_fenceEvent;
+UINT64 g_fenceValue;
 
 #endif /* _H_RENDERER */
 

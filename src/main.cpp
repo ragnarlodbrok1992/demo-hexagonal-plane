@@ -1,32 +1,26 @@
 
 // Configuration variables - might go even before we include stuff if this stuff ends up in different files
-constexpr int DISPLAY_FACTOR = 60;
+constexpr int DISPLAY_FACTOR = 100;
 constexpr int DISPLAY_WIDTH = 16 * DISPLAY_FACTOR;
 constexpr int DISPLAY_HEIGHT = 9 * DISPLAY_FACTOR;
 
 
-#include "renderer.cpp"
+#include "win32_renderer.cpp"
 #include "win_utils.cpp"
 #include "camera.cpp"
 #include "input.cpp"
 #include "entities/cube.cpp"
 #include "shaders/win32_default_shaders.cpp"
 #include "render_pipeline/on_init.cpp"
+#include "render_pipeline/on_init_compile_shaders.cpp"
 
 #include <Windows.h>
-#include <d3d12.h>
-#include <dxgi1_6.h>
-#include <d3dcompiler.h>
 #include <wrl.h>
 #include <cstdlib>
 #include <ctime>
 
 // Global variables
 HWND g_hwnd = NULL;
-
-// DirectX3D 12 renderer - win32 part
-win32_Renderer renderer = {0};
-win32_Shaders shaders   = {0};
 
 // Pack this together? This is used for objects that are being renderer
 // Entities on the screen.
@@ -38,9 +32,6 @@ D3D12_VERTEX_BUFFER_VIEW vertexBufferView;
 D3D12_INDEX_BUFFER_VIEW indexBufferView;
 UINT8* constantBufferView;  // There is something called D3D12_CONSTANT_BUFFER_VIEW_DESC in d3d12.h
 
-// Some fence stuff - TODO(moliwa): Move to renderer
-HANDLE g_fenceEvent;
-UINT64 g_fenceValue;
 
 struct MVPMatrix {
     DirectX::XMMATRIX world;
@@ -56,7 +47,7 @@ DirectX::XMMATRIX g_projectionMatrix;
 
 
 // Forward declarations - maybe remove them?
-void onInit();
+// void onInit(win32_Renderer renderer);
 void prepareCube();
 void prepareCamera();
 void onUpdate();
@@ -132,7 +123,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     g_hwnd = CreateWindowExA(
         0, CLASS_NAME, "DirectX 12 Learning Code...", WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT, 1280, 720,
+        CW_USEDEFAULT, CW_USEDEFAULT,
+        DISPLAY_WIDTH, DISPLAY_HEIGHT,
         nullptr, nullptr, hInstance, nullptr
     );
 
@@ -143,7 +135,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     // TODO(ragnar): Remove exception
     // TODO(ragnar): Split this calls - we don't know what fails
     try {
-        onInit();
+        onInit(renderer, g_hwnd); // Some stuff get's passed, because for other renderers we need to have window handler in main module
+        onInitCompileShaders(renderer, shaders, win32_shader);
         prepareCamera();
         prepareCube();
     } catch (const std::runtime_error& e) {
@@ -169,149 +162,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     return static_cast<char>(msg.wParam);
 }
 
-
-void onInit() {
-    // Enable the D3D12 debug layer.
-#if defined(DEBUG_DIRECTX)
-    {
-      #pragma message("DEBUG_DIRECTX defined - setting up debug layer for DirectX3D 12.")
-        Microsoft::WRL::ComPtr<ID3D12Debug> debugController;
-        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController)))) {
-            debugController->EnableDebugLayer();
-        }
-    }
-#endif
-
-    Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
-    ThrowIfFailed(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
-    ThrowIfFailed(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&renderer.device)));
-
-    D3D12_COMMAND_QUEUE_DESC queueDesc = {};
-    queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
-    queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    ThrowIfFailed(renderer.device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&renderer.command_queue)));
-
-    Microsoft::WRL::ComPtr<IDXGISwapChain1> swapChain;
-    DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {};
-    swapChainDesc.BufferCount = BUFFER_COUNT;
-    swapChainDesc.Width = 1280;
-    swapChainDesc.Height = 720;
-    swapChainDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    swapChainDesc.SampleDesc.Count = 1;
-    ThrowIfFailed(factory->CreateSwapChainForHwnd(
-        renderer.command_queue.Get(),
-        g_hwnd,
-        &swapChainDesc,
-        nullptr,
-        nullptr,
-        &swapChain
-    ));
-    ThrowIfFailed(factory->MakeWindowAssociation(g_hwnd, DXGI_MWA_NO_ALT_ENTER));
-    ThrowIfFailed(swapChain.As(&renderer.swap_chain));
-    FRAME_INDEX = renderer.swap_chain->GetCurrentBackBufferIndex();
-
-    D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {};
-    rtvHeapDesc.NumDescriptors = BUFFER_COUNT;
-    rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    rtvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-    ThrowIfFailed(renderer.device->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&renderer.rtv_heap)));
-    RTV_DESCRIPTOR_SIZE = renderer.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-
-    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = renderer.rtv_heap->GetCPUDescriptorHandleForHeapStart();
-    for (UINT n = 0; n < BUFFER_COUNT; n++) {
-        ThrowIfFailed(renderer.swap_chain->GetBuffer(n, IID_PPV_ARGS(&renderer.render_targets[n])));
-        renderer.device->CreateRenderTargetView(renderer.render_targets[n].Get(), nullptr, rtvHandle);
-        rtvHandle.ptr += RTV_DESCRIPTOR_SIZE;
-    }
-
-    ThrowIfFailed(renderer.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&renderer.command_allocator)));
-
-    D3D12_ROOT_PARAMETER rootParameters[1];
-    D3D12_ROOT_SIGNATURE_DESC rootSignatureDesc = {};
-    rootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    rootParameters[0].Descriptor.ShaderRegister = 0;
-    rootParameters[0].Descriptor.RegisterSpace = 0;
-    rootParameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    rootSignatureDesc.NumParameters = _countof(rootParameters);
-    rootSignatureDesc.pParameters = rootParameters;
-    rootSignatureDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
-    Microsoft::WRL::ComPtr<ID3DBlob> signature;
-    Microsoft::WRL::ComPtr<ID3DBlob> error;
-    ThrowIfFailed(D3D12SerializeRootSignature(&rootSignatureDesc, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &error));
-    ThrowIfFailed(renderer.device->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(), IID_PPV_ARGS(&renderer.root_signature)));
-
-#if defined(DEBUG_DIRECTX)
-    #pragma message("DEBUG_DIRECTX defined - setting up shaders compile flags to DEBUG/SKIP_OPTIMIZATION.")
-    UINT compileFlags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
-#else
-    UINT compileFlags = 0;
-#endif
-
-    ThrowIfFailed(D3DCompile(win32_shader, strlen(win32_shader), nullptr, nullptr, nullptr, "VSMain", "vs_5_0", compileFlags, 0, &shaders.vertexShader, nullptr));
-    ThrowIfFailed(D3DCompile(win32_shader, strlen(win32_shader), nullptr, nullptr, nullptr, "PSMain", "ps_5_0", compileFlags, 0, &shaders.pixelShader, nullptr));
-
-        D3D12_INPUT_ELEMENT_DESC inputElementDescs[] = {
-            { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-            { "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
-        };
-        D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
-        psoDesc.InputLayout = { inputElementDescs, _countof(inputElementDescs) };
-        psoDesc.pRootSignature = renderer.root_signature.Get();
-        psoDesc.VS = { reinterpret_cast<UINT8*>(shaders.vertexShader->GetBufferPointer()), shaders.vertexShader->GetBufferSize() };
-        psoDesc.PS = { reinterpret_cast<UINT8*>(shaders.pixelShader->GetBufferPointer()), shaders.pixelShader->GetBufferSize() };
-        
-        D3D12_RASTERIZER_DESC rasterizerDesc = {};
-        rasterizerDesc.FillMode = D3D12_FILL_MODE_SOLID;
-        rasterizerDesc.CullMode = D3D12_CULL_MODE_BACK;
-        rasterizerDesc.FrontCounterClockwise = FALSE;
-        rasterizerDesc.DepthBias = D3D12_DEFAULT_DEPTH_BIAS;
-        rasterizerDesc.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
-        rasterizerDesc.SlopeScaledDepthBias = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
-        rasterizerDesc.DepthClipEnable = TRUE;
-        rasterizerDesc.MultisampleEnable = FALSE;
-        rasterizerDesc.AntialiasedLineEnable = FALSE;
-        rasterizerDesc.ForcedSampleCount = 0;
-        rasterizerDesc.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
-        psoDesc.RasterizerState = rasterizerDesc;
-
-        D3D12_BLEND_DESC blendDesc = {};
-        blendDesc.AlphaToCoverageEnable = FALSE;
-        blendDesc.IndependentBlendEnable = FALSE;
-        const D3D12_RENDER_TARGET_BLEND_DESC defaultRenderTargetBlendDesc =
-        {
-            FALSE,FALSE,
-            D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD,
-            D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD,
-            D3D12_LOGIC_OP_NOOP,
-            D3D12_COLOR_WRITE_ENABLE_ALL,
-        };
-        for (UINT i = 0; i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
-            blendDesc.RenderTarget[i] = defaultRenderTargetBlendDesc;
-        psoDesc.BlendState = blendDesc;
-
-        psoDesc.DepthStencilState.DepthEnable = FALSE;
-        psoDesc.DepthStencilState.StencilEnable = FALSE;
-        psoDesc.SampleMask = UINT_MAX;
-        psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        psoDesc.NumRenderTargets = 1;
-        psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-        psoDesc.SampleDesc.Count = 1;
-        ThrowIfFailed(renderer.device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&renderer.pipeline_state)));
-
-    ThrowIfFailed(renderer.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, renderer.command_allocator.Get(), renderer.pipeline_state.Get(), IID_PPV_ARGS(&renderer.command_list)));
-    ThrowIfFailed(renderer.command_list->Close());
-
-    ThrowIfFailed(renderer.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&renderer.fence)));
-    g_fenceValue = 1;
-
-    g_fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-    if (g_fenceEvent == nullptr) {
-        ThrowIfFailed(HRESULT_FROM_WIN32(GetLastError()));
-    }
-}
-
 void prepareCamera () {
     // Renderer initialized, below stuff is engine related
     
@@ -328,7 +178,7 @@ void prepareCamera () {
     g_viewMatrix = DirectX::XMMatrixLookAtLH(eye, at, up);
 
     // Perspective projection provided straight from microsoft vaults.
-    g_projectionMatrix = DirectX::XMMatrixPerspectiveFovLH(DirectX::XM_PIDIV4, 1280.0f / 720.0f, 0.1f, 100.0f);
+    g_projectionMatrix = DirectX::XMMatrixPerspectiveFovLH(DirectX::XM_PIDIV4, (float)DISPLAY_WIDTH / (float)DISPLAY_HEIGHT, 0.1f, 100.0f);
 
     // WaitForPreviousFrame();
 }
@@ -446,8 +296,8 @@ void onRender() {
     renderer.command_list->SetGraphicsRootSignature(renderer.root_signature.Get());
     renderer.command_list->SetGraphicsRootConstantBufferView(0, constantBuffer->GetGPUVirtualAddress());
 
-    D3D12_VIEWPORT viewport = { 0.0f, 0.0f, 1280.0f, 720.0f, D3D12_MIN_DEPTH, D3D12_MAX_DEPTH };
-    D3D12_RECT scissorRect = { 0, 0, 1280, 720 };
+    D3D12_VIEWPORT viewport = { 0.0f, 0.0f, DISPLAY_WIDTH, DISPLAY_HEIGHT, D3D12_MIN_DEPTH, D3D12_MAX_DEPTH };
+    D3D12_RECT scissorRect = { 0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT };
     renderer.command_list->RSSetViewports(1, &viewport);
     renderer.command_list->RSSetScissorRects(1, &scissorRect);
 
