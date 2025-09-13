@@ -1,0 +1,8 @@
+vcvars.bat
+build/
+notes/
+tags
+
+*.rdbg
+*.vim
+
