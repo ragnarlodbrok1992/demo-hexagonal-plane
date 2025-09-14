@@ -4,6 +4,8 @@ constexpr int DISPLAY_FACTOR = 100;
 constexpr int DISPLAY_WIDTH = 16 * DISPLAY_FACTOR;
 constexpr int DISPLAY_HEIGHT = 9 * DISPLAY_FACTOR;
 
+// Top-level defines
+#include "graphics/defines.cpp"
 
 #include "win32_renderer.cpp"
 #include "win_utils.cpp"
@@ -33,21 +35,17 @@ D3D12_INDEX_BUFFER_VIEW indexBufferView;
 UINT8* constantBufferView;  // There is something called D3D12_CONSTANT_BUFFER_VIEW_DESC in d3d12.h
 
 
-struct MVPMatrix {
+typedef struct {
     DirectX::XMMATRIX world;
     DirectX::XMMATRIX view;
     DirectX::XMMATRIX projection;
-};
+} MVPMatrix;
 
-MVPMatrix constantBufferData;
-
-DirectX::XMMATRIX g_worldMatrix; // Rotation stuff becomes worldMatrix TODO(moliwa): Copy it from camera?
-DirectX::XMMATRIX g_viewMatrix;
-DirectX::XMMATRIX g_projectionMatrix;
-
+// TODO(ragnar): Rename it to something better
+MVPMatrix constantBufferData;  // MVP matrices go here - stuff that lands in shader
+MVPMatrix cameraData;
 
 // Forward declarations - maybe remove them?
-// void onInit(win32_Renderer renderer);
 void prepareCube();
 void prepareCamera();
 void onUpdate();
@@ -165,7 +163,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 void prepareCamera () {
     // Renderer initialized, below stuff is engine related
     
-    g_worldMatrix = DirectX::XMMatrixIdentity();
+    cameraData.world = DirectX::XMMatrixIdentity();
 
     // Maybe we can write something about DirectX3D space coordinates?
     // It's right hand - pointed straight to our face. Thumb is y, second finger is x, first finger is z.
@@ -175,12 +173,13 @@ void prepareCamera () {
     DirectX::XMVECTOR eye = DirectX::XMVectorSet(2.0f, 2.0f, -2.0f, 0.0f);
     DirectX::XMVECTOR at  = DirectX::XMVectorSet(0.0f, 0.0f, 0.0f, 0.0f);
     DirectX::XMVECTOR up  = DirectX::XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
-    g_viewMatrix = DirectX::XMMatrixLookAtLH(eye, at, up);
+    cameraData.view = DirectX::XMMatrixLookAtLH(eye, at, up);
 
     // Perspective projection provided straight from microsoft vaults.
-    g_projectionMatrix = DirectX::XMMatrixPerspectiveFovLH(DirectX::XM_PIDIV4, (float)DISPLAY_WIDTH / (float)DISPLAY_HEIGHT, 0.1f, 100.0f);
-
-    // WaitForPreviousFrame();
+    cameraData.projection = DirectX::XMMatrixPerspectiveFovLH(DirectX::XM_PIDIV4,
+        (float)DISPLAY_WIDTH / (float)DISPLAY_HEIGHT,
+        0.1f,
+        100.0f);
 }
 
 // Test function to properly render our test cube
@@ -279,57 +278,52 @@ void prepareCube() {
 
 void onUpdate() {
     DirectX::XMMATRIX rotationMatrix = DirectX::XMMatrixRotationX(camera.rotation_x) * DirectX::XMMatrixRotationY(camera.rotation_y);
-    g_worldMatrix = rotationMatrix;
+    cameraData.world = rotationMatrix;
 
     // Transpose the matrices to be column-major for the shader.
-    constantBufferData.world = DirectX::XMMatrixTranspose(g_worldMatrix);
-    constantBufferData.view = DirectX::XMMatrixTranspose(g_viewMatrix);
-    constantBufferData.projection = DirectX::XMMatrixTranspose(g_projectionMatrix);
+    constantBufferData.world = DirectX::XMMatrixTranspose(cameraData.world);
+    constantBufferData.view = DirectX::XMMatrixTranspose(cameraData.view);
+    constantBufferData.projection = DirectX::XMMatrixTranspose(cameraData.projection);
     
     memcpy(constantBufferView, &constantBufferData, sizeof(constantBufferData));
 }
 
 void onRender() {
-    ThrowIfFailed(renderer.command_allocator->Reset());
-    ThrowIfFailed(renderer.command_list->Reset(renderer.command_allocator.Get(), renderer.pipeline_state.Get()));
-
-    renderer.command_list->SetGraphicsRootSignature(renderer.root_signature.Get());
-    renderer.command_list->SetGraphicsRootConstantBufferView(0, constantBuffer->GetGPUVirtualAddress());
-
+    // Begin stuff - always has to be done independent of what is being rendered?
     D3D12_VIEWPORT viewport = { 0.0f, 0.0f, DISPLAY_WIDTH, DISPLAY_HEIGHT, D3D12_MIN_DEPTH, D3D12_MAX_DEPTH };
     D3D12_RECT scissorRect = { 0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT };
+    D3D12_RESOURCE_BARRIER barrier = {};
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = renderer.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    ID3D12CommandList* ppCommandLists[] = { renderer.command_list.Get() };
+
+    ThrowIfFailed(renderer.command_allocator->Reset());
+    ThrowIfFailed(renderer.command_list->Reset(renderer.command_allocator.Get(), renderer.pipeline_state.Get()));
+    renderer.command_list->SetGraphicsRootSignature(renderer.root_signature.Get());
+    renderer.command_list->SetGraphicsRootConstantBufferView(0, constantBuffer->GetGPUVirtualAddress());
     renderer.command_list->RSSetViewports(1, &viewport);
     renderer.command_list->RSSetScissorRects(1, &scissorRect);
-
-    D3D12_RESOURCE_BARRIER barrier = {};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = renderer.render_targets[FRAME_INDEX].Get();
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     renderer.command_list->ResourceBarrier(1, &barrier);
-
-    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = renderer.rtv_heap->GetCPUDescriptorHandleForHeapStart();
     rtvHandle.ptr += FRAME_INDEX * RTV_DESCRIPTOR_SIZE;
     renderer.command_list->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
-
-    const float clearColor[] = { 0.0f, 0.0f, 0.4f, 1.0f };
+    
+    // Render stuff goes here - vertexBufferView and indexBufferView
     renderer.command_list->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
     renderer.command_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     renderer.command_list->IASetVertexBuffers(0, 1, &vertexBufferView);
     renderer.command_list->IASetIndexBuffer(&indexBufferView);
     renderer.command_list->DrawIndexedInstanced(36, 1, 0, 0, 0);
 
+    // End stuff - always has to be done independent of what is being rendered?
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     renderer.command_list->ResourceBarrier(1, &barrier);
-
     ThrowIfFailed(renderer.command_list->Close());
-
-    ID3D12CommandList* ppCommandLists[] = { renderer.command_list.Get() };
     renderer.command_queue->ExecuteCommandLists(_countof(ppCommandLists), ppCommandLists);
-
     ThrowIfFailed(renderer.swap_chain->Present(1, 0));
-
     WaitForPreviousFrame();
 }
 
@@ -338,6 +332,8 @@ void onDestroy() {
     CloseHandle(g_fenceEvent);
 }
 
+// TODO(moliwa): This should go to onRender pipline and stay there forever and ever
+// This function is only called in onRender
 void WaitForPreviousFrame() {
     const UINT64 fence = g_fenceValue;
     ThrowIfFailed(renderer.command_queue->Signal(renderer.fence.Get(), fence));
